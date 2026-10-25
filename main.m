@@ -1,68 +1,23 @@
-clear;
-
-% Add search path
-addpath(genpath(pwd));
-
-% Read data
-dat_all = readtable("WTI_Formatted.csv");
-date_all = table2array(dat_all(:, 2)); % trading days
-date_all = datetime(date_all, 'InputFormat', 'dd/MM/yyyy');
-
-index = find(date_all >= datetime(2010, 1, 1) & date_all <= datetime(2019, 12, 31)); 
-dat = dat_all(index, 3: 69);
-date = date_all(index);
-price_daily = zeros(size(dat));
-for i = 1: size(dat, 2)
-    if isnumeric(dat{:, i})
-        price_daily(:, i) = dat{:, i};
-    elseif iscell(dat{:, i})
-        price_daily(:, i) = str2double(dat{:, i});
-    end
-end
-
-% Select the first observation of each month
-[~, unique_index, ~] = unique(year(date) + month(date)/100); 
-%maturity = [1, 6: 6: 67]/12; 
-maturity = (1: 12)/12; 
-price = price_daily(unique_index, maturity*12); % monthly price
-date_monthly = date(unique_index);
-
-% Factors extracted from US Tresury yields 
-US = readtable("US_less1year_2Factors.csv");
-US = table2array(US);
-US_st1 = readtable("US_st1.csv");
-US_st1 = table2array(US_st1);
-US_st2 = readtable("US_st2.csv");
-US_st2 = table2array(US_st2);
-
-% US Treasury yield data
-treasury = readtable("US_12Con.csv");
-treasury = table2array(treasury(:, 2: 6));
-
-% Global setups
-dt = 1/12;
-[n_obs, n_contract] = size(price);
-n_factor = size(US, 2);
-st1_start = datetime("01/12/2014", 'InputFormat', 'dd/MM/yyyy'); % start date of stress test 1
-st1_end = datetime("31/12/2015", 'InputFormat', 'dd/MM/yyyy'); % end date of stress test 1
-st2_start = datetime("01/12/2014", 'InputFormat', 'dd/MM/yyyy'); % start date of stress test 2
-
 %%
 clear;
 
 % Add search path
 addpath(genpath(pwd));
 
-US = readtable("US_3factors_period4.csv");
+US = readtable("Data/Data1/US_FPCA_2factors_period1.csv");
+%US = readtable("US_2factors_period1.csv");
 US = table2array(US);
 
-price = readtable("WTI4.csv");
+USTreasury = readtable("USTreasury_period1.csv");
+USTreasury = table2array(USTreasury);
+
+price = readtable("WTI1.csv");
 price = table2array(price(:, 2:13));
 
 maturity = (1: 12)/12; 
 dt = 1/12;
 [n_obs, n_contract] = size(price);
-n_factor = size(US, 2);
+%n_factor = size(US, 2);
 
 %% Schwartz-Smith two-factor model
 yt = log(price);
@@ -85,7 +40,7 @@ mdl1 = ssm(@(parameter) schwartz_smith_model(parameter, yt, maturity, dt));
 options = optimoptions('fmincon','MaxFunEvals',50000,...
     'TolFun',1e-8,'TolX',1e-8,'MaxIter',1000,'Display','off');
 
-[est_mdl1, par1, ~, ~, exit1] = estimate(mdl1, yt, par0, 'Display', 'off', ...
+[est_mdl1, par1, ~, logL1, exit1] = estimate(mdl1, yt, par0, 'Display', 'off', ...
     'options', options, 'Univariate', true, 'lb', lb, 'ub', ub, 'Aineq', Aineq, 'bineq', bineq);
 
 % Estimation errors
@@ -101,10 +56,12 @@ rmse1 = sqrt( mean(residual1 .^ 2) );
 rmse1_month = sqrt( mean(residual1 .^ 2, 2) ); 
 
 rmse1 = rmse1';
+[AIC1, BIC1] = aicbic(logL1, numel(par1), size(yt,1));
 
 %% Two-factor functional regression model 
 yt = log(price); 
 factor = US;
+n_factor = size(factor, 2);
 
 % Restrictions
 lb = [1e-08, 1e-08, -Inf, 1e-08, 1e-08, -0.9999, -Inf, -Inf,...
@@ -127,7 +84,7 @@ mdl2 = ssm(@(parameter) functional_regression_model(parameter, yt, maturity, fac
 options = optimoptions('fmincon','MaxFunEvals',50000,...
     'TolFun',1e-8,'TolX',1e-8,'MaxIter',1000,'Display','off');
 
-[est_mdl2, par2, ~, ~, exit2] = estimate(mdl2, yt, par0, 'Display', 'off', ...
+[est_mdl2, par2, ~, logL2, exit2] = estimate(mdl2, yt, par0, 'Display', 'off', ...
     'options', options, 'Univariate', true, 'lb', lb, 'ub', ub, 'Aineq', Aineq, 'bineq', bineq);
 
 % Estimation errors
@@ -145,40 +102,65 @@ rmse2 = sqrt( mean(residual2 .^ 2) );
 rmse2_month = sqrt( mean(residual2 .^ 2, 2) ); 
 
 rmse2 = rmse2';
+[AIC2, BIC2] = aicbic(logL2, numel(par2), size(yt,1));
 
-% Covariance of filtered observations
-cov_state = cat(3, output2.FilteredStatesCov);
-%cov_Y = zeros(n_contract, n_contract, n_obs);
-%for i = 1: n_obs
-%    cov_Y(:, :, i) = est_mdl2.C * cov_state(:, :, i) * est_mdl2.C' + est_mdl2.D * est_mdl2.D';
-%end
+%% ARX-LSC Model 
+yt = log(price); 
+dim = size(yt, 2);
 
-% Samples from state variables 
-rng(1234);
-n_sample = 1000;
-sample_yt = zeros(n_obs, n_contract, n_sample);
-for i = 61: n_obs
-    if det(cov_state(:, :, i)) < 0 
-        [e_vector, e_value] = eig(cov_state(:, :, i));
-        e_value(e_value<0) = 1e-08;
-        cov_state(:, :, i) = e_vector * e_value * e_vector';
-    end
-    sample_state = mvnrnd(estimated_states2(i, :), cov_state(:, :, i), n_sample);
-    sample_yt(i, :, :) = (sample_state * est_mdl2.C' + factor(i, :)*G' + F')';
+level = mean(USTreasury, 2);
+slope = USTreasury(:, 5) - USTreasury(:, 1);
+curvature = 2 * USTreasury(:, 3) - USTreasury(:, 1) - USTreasury(:, 5);
+X = [level, slope, curvature];
+
+rmse = zeros(dim, 1); 
+AIC = zeros(dim, 1);
+BIC = zeros(dim, 1); 
+
+for i = 1: size(yt, 2)
+    Y = yt(2:end, i);
+    Z = [yt(1:(end-1), i), X(2:end, :)]; 
+
+    est_ARX_LSC = fitlm(Z, Y);
+
+    fitted_log = predict(est_ARX_LSC, Z);
+    fitted_price = exp(fitted_log);
+
+    actual_price = price(2:end, i);
+
+    rmse(i) = sqrt(mean((actual_price - fitted_price).^2));
+    AIC(i) = est_ARX_LSC.ModelCriterion.AIC;
+    BIC(i) = est_ARX_LSC.ModelCriterion.BIC;
 end
 
-% Save data
-%writematrix(G, "Data/Coe/coe_less5year_6factors.csv")
+rmse_all = mean(rmse);
+AIC_all = sum(AIC);
+BIC_all = sum(BIC);
 
-% Spread under different stress
-%original = estimated_yt2; % if original US factors
-%cov_Y_original = cov_Y;
-%sample_original = sample_yt;
+%% F-test for non-linearity
+yt = log(price); 
+dim = size(yt, 2);
 
-stress2 = estimated_yt2;  
-%cov_Y_2 = cov_Y;
-sample_stress_2 = sample_yt;
+X = [US(:, 1), US(:, 2)];
+q = 3; % number of additional non-linear coefficients 
 
+F_stat = zeros(dim, 1); 
+p_value = zeros(dim, 1);
+
+for i = 1: size(yt, 2)
+    Y = yt(2:end, i);
+    Z1 = [yt(1:(end-1), i), X(2:end, :)]; 
+    Z2 = [yt(1:(end-1), i), X(2:end, :), X(2:end, :).^2, X(2:end, 1).*X(2:end, 2)]; 
+
+    mdl_re = fitlm(Z1, Y); % restricted model
+    mdl_un = fitlm(Z2, Y); % unrestricted model
+
+    SSE_re = mdl_re.SSE;
+    SSE_un = mdl_un.SSE;
+    
+    F_stat(i) = ( (SSE_re - SSE_un)/q ) / ( SSE_un/mdl_un.DFE ); 
+    p_value(i) = fcdf(F_stat(i), q, mdl_un.DFE, 'upper');
+end
 
 %% Plots
 % Futures curve
@@ -239,113 +221,6 @@ box on;
 hold on;
 plot(date_monthly(101:120), treasury(101:120, 1), "r", "LineWidth", 1);
 plot(date_monthly(101:120), treasury(101:120, end), "b", "LineWidth", 1);
-
-%% Spread under different stress
-shock = 1;
-stress = stress1;
-sample_stress = sample_stress_1;
-%cov_Y_st = cov_Y_1;
-st = "st1";
-
-diff = exp(original) - exp(stress);
-diff(1: 60, :) = 0;
-mean_diff = zeros(size(diff, 1), 3); 
-mean_diff(:, 1) = mean(diff(:, 1: 4), 2); 
-mean_diff(:, 2) = mean(diff(:, 5: 8), 2);
-mean_diff(:, 3) = mean(diff(:, 9: 12), 2); 
-
-% Sampling from state variables
-sample_diff2 = exp(sample_original) - exp(sample_stress);
-sample_mean_diff2 = zeros(n_obs, 3, n_sample);
-sample_mean_diff2(:, 1, :) = mean(sample_diff2(:, 1: 4, :), 2);
-sample_mean_diff2(:, 2, :) = mean(sample_diff2(:, 5: 8, :), 2);
-sample_mean_diff2(:, 3, :) = mean(sample_diff2(:, 9: 12, :), 2);
-sample_mean_diff2 = sort(sample_mean_diff2, 3); 
-
-
-% Mean difference of short-end, middle, and long-end maturity
-colors = [228, 26, 28;
-          55, 126, 184;
-          77, 175, 74];
-figure; 
-set(gcf, 'Position', [100, 100, 900, 600]);
-ax = gca;
-ax.FontSize = 22; 
-hold on;
-for i = 1: 3
-    plot(date_monthly, mean_diff(:, i), "Color", colors(i, :)/255, "LineWidth", 1);
-end
-for i = 1: 3
-    plot(date_monthly, sample_mean_diff2(:, i, 25), "--", "Color", colors(i, :)/255, "LineWidth", 0.5);
-    plot(date_monthly, sample_mean_diff2(:, i, 975), "--", "Color", colors(i, :)/255, "LineWidth", 0.5);
-end
-yline(0, "LineWidth", 0.5);
-%ylim([-0.1, 0.3]);
-yLimits = ylim;
-if shock == 1
-    xline(st1_start, "k", "LineWidth", 1.5);
-    text(st1_start, yLimits(1), "Shock starts", ...
-        'FontSize', 22, ...
-        'VerticalAlignment', 'bottom', ...
-        'HorizontalAlignment', 'left');
-    xline(st1_end, "k", "LineWidth", 1.5);
-    text(st1_end, yLimits(1)+0.03, "Shock ends", ...
-        'FontSize', 22, ...
-        'VerticalAlignment', 'bottom', ...
-        'HorizontalAlignment', 'left');
-elseif shock == 2
-    xline(st2_start, "k", "LineWidth", 1.5);
-    text(st2_start, yLimits(1), "Shock starts", ...
-        'FontSize', 22, ...
-        'VerticalAlignment', 'bottom', ...
-        'HorizontalAlignment', 'left');
-end
-xlabel("Date"); 
-ylabel("Mean difference in futures price");
-legend(["Short-end maturity", "Middle maturity", "Long-end maturity"], "Location", "northwest");
-
-saveas(gcf, append("Mean_diff_in_", st, ".jpg"));
-
-% Difference of all curves
-colors = [166,206,227; 
-          31,120,180;
-          178,223,138;
-          51,160,44;
-          251,154,153;
-          227,26,28;
-          253,191,111;
-          255,127,0;
-          202,178,214;
-          106,61,154;
-          255,255,153;
-          177,89,40];
-figure;
-set(gcf, 'Position', [100, 100, 900, 600]);
-hold on;
-for i = 1: size(diff, 2)
-    plot(date_monthly, diff(:, i), "Color", colors(i, :)/255, "LineWidth", 1);
-end
-if shock == 1
-    xline(st1_start, "k", "LineWidth", 1.5);
-    text(st1_start, yLimits(1), "Shock starts", ...
-        'VerticalAlignment', 'bottom', ...
-        'HorizontalAlignment', 'left');
-    xline(st1_end, "k", "LineWidth", 1.5);
-    text(st1_end, yLimits(1), "Shock ends", ...
-        'VerticalAlignment', 'bottom', ...
-        'HorizontalAlignment', 'left');
-elseif shock == 2
-    xline(st2_start, "k", "LineWidth", 1.5);
-    text(st2_start, yLimits(1), "Shock starts", ...
-        'VerticalAlignment', 'bottom', ...
-        'HorizontalAlignment', 'left');
-end
-xlabel("Date"); 
-ylabel("Difference in yields");
-lgd = legend(["1 month", "3 months","6 months", "9 months", "1 year", "2 years", "3 years", "5 years", ...
-    "7 years", "10 years", "20 years", "30 years"], "Location", "northwest");
-title(lgd, "Time to maturity"); 
-
 
 
 
